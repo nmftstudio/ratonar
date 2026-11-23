@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Caza Ratones AR</title>
+<style>
+  :root { --bg:#0a0c10; --fg:#e8f0ff; --acc:#6cf5b5; --acc2:#ff7ad9; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  html,body { height:100%; background:var(--bg); color:var(--fg); font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; overflow:hidden; touch-action:none; }
+  canvas { position:fixed; inset:0; width:100%; height:100%; display:block; }
+  video { position:fixed; width:1px; height:1px; opacity:0; pointer-events:none; }
+  #hud { position:fixed; top:0; left:0; right:0; display:flex; justify-content:space-between; align-items:flex-start; padding:14px 18px; pointer-events:none; text-shadow:0 2px 8px #000; }
+  #hud .big { font-size:clamp(28px,6vw,52px); font-weight:800; line-height:1; }
+  #hud .small { font-size:13px; opacity:.8; letter-spacing:.08em; text-transform:uppercase; }
+  #combo { color:var(--acc2); font-weight:800; min-height:1.2em; }
+  #fps { position:fixed; bottom:8px; left:10px; font:11px monospace; opacity:.5; }
+  #panel { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:16px; text-align:center; padding:24px; background:radial-gradient(circle at 50% 40%, #16202ecc, #05070bee); }
+  #panel.hidden { display:none; }
+  #panel h1 { font-size:clamp(32px,7vw,64px); letter-spacing:-.02em; }
+  #panel p { max-width:460px; opacity:.85; line-height:1.5; }
+  button { font:inherit; font-weight:700; color:#06120c; background:var(--acc); border:0; border-radius:999px; padding:14px 34px; font-size:18px; cursor:pointer; box-shadow:0 0 28px #6cf5b566; }
+  button.ghost { background:transparent; color:var(--fg); border:1px solid #ffffff44; box-shadow:none; font-size:14px; padding:8px 18px; }
+  button:active { transform:scale(.97); }
+  #msg { min-height:1.4em; color:var(--acc2); font-size:14px; }
+</style>
+</head>
+<body>
+<video id="video" playsinline muted></video>
+<canvas id="c"></canvas>
+
+<div id="hud">
+  <div><div class="small">Puntos</div><div class="big" id="score">0</div><div id="combo"></div></div>
+  <div style="text-align:right"><div class="small">Tiempo</div><div class="big" id="time">45</div><div class="small" id="best"></div></div>
+</div>
+<div id="fps"></div>
+
+<div id="panel">
+  <h1>🐭 Caza Ratones AR</h1>
+  <p id="intro">Los ratones corren por encima de tu cámara. <b>Cerrá el puño</b> sobre uno para atraparlo. Más rápido = más combo.</p>
+  <button id="start">Activar cámara y jugar</button>
+  <button class="ghost" id="mode">Modo: agarrar (puño)</button>
+  <div id="msg"></div>
+</div>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const $ = id => document.getElementById(id);
+const video = $('video'), cv = $('c'), ctx = cv.getContext('2d');
+const panel = $('panel'), msg = $('msg');
+
+let W = 0, H = 0, DPR = 1;
+function resize(){
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  cv.width = W*DPR; cv.height = H*DPR;
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+}
+addEventListener('resize', resize); resize();
+
+/* ---------- Estado ---------- */
+const GAME_TIME = 45;
+let state = 'idle';          // idle | playing | over
+let grabMode = true;         // true: puño | false: tocar
+let score = 0, combo = 0, lastCatch = -99, timeLeft = GAME_TIME, best = +(localStorage.getItem('ratones_best')||0);
+let mice = [], particles = [], rings = [], floaters = [];
+let hands = [];              // [{pts:[{x,y}], palm:{x,y}, size, closed}]
+let landmarker = null, lastVideoTime = -1, spawnT = 0;
+$('best').textContent = best ? 'Récord ' + best : '';
+
+/* ---------- Audio (blop) ---------- */
+let actx = null;
+function blop(pitch = 1){
+  if(!actx) return;
+  const t = actx.currentTime;
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.type = 'sine';
+  o.frequency.setValueAtTime(220*pitch, t);
+  o.frequency.exponentialRampToValueAtTime(720*pitch, t+0.09);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(0.5, t+0.015);
+  g.gain.exponentialRampToValueAtTime(0.0001, t+0.22);
+  o.connect(g).connect(actx.destination);
+  o.start(t); o.stop(t+0.25);
+  // burbujita extra
+  const o2 = actx.createOscillator(), g2 = actx.createGain();
+  o2.type = 'triangle';
+  o2.frequency.setValueAtTime(900*pitch, t+0.05);
+  o2.frequency.exponentialRampToValueAtTime(300*pitch, t+0.16);
+  g2.gain.setValueAtTime(0.0001, t+0.05);
+  g2.gain.exponentialRampToValueAtTime(0.12, t+0.07);
+  g2.gain.exponentialRampToValueAtTime(0.0001, t+0.18);
+  o2.connect(g2).connect(actx.destination);
+  o2.start(t+0.05); o2.stop(t+0.2);
+}
+function tick(){ if(!actx) return; const t=actx.currentTime,o=actx.createOscillator(),g=actx.createGain(); o.frequency.value=880; g.gain.setValueAtTime(.15,t); g.gain.exponentialRampToValueAtTime(.0001,t+.12); o.connect(g).connect(actx.destination); o.start(t); o.stop(t+.13); }
+
+/* ---------- Mapeo video -> pantalla (cover + espejo) ---------- */
+function mapPt(p){
+  const vw = video.videoWidth || 640, vh = video.videoHeight || 480;
+  const s = Math.max(W/vw, H/vh);
+  const dx = (W - vw*s)/2, dy = (H - vh*s)/2;
+  return { x: W - (dx + p.x*vw*s), y: dy + p.y*vh*s };
+}
+const dist = (a,b) => Math.hypot(a.x-b.x, a.y-b.y);
+
+function processHands(res){
+  hands = [];
+  if(!res || !res.landmarks) return;
+  for(const lm of res.landmarks){
+    const pts = lm.map(mapPt);
+    const palm = {
+      x: (pts[0].x+pts[5].x+pts[9].x+pts[13].x+pts[17].x)/5,
+      y: (pts[0].y+pts[5].y+pts[9].y+pts[13].y+pts[17].y)/5
+    };
+    const size = dist(pts[0], pts[9]);                // muñeca -> nudillo medio
+    const tips = [8,12,16,20].map(i => dist(pts[i], pts[0]));
+    const ratio = (tips.reduce((a,b)=>a+b,0)/4) / (size || 1);
+    hands.push({ pts, palm, size, ratio, closed: ratio < 1.45 });
+  }
+}
+
+/* ---------- Ratones ---------- */
+const mouseSize = () => Math.max(24, Math.min(W,H)*0.05);
+function spawnMouse(){
+  const s = mouseSize()*(0.85+Math.random()*0.35);
+  const edge = Math.floor(Math.random()*4);
+  let x,y,a;
+  if(edge===0){ x=-s; y=Math.random()*H; a=Math.random()*1-.5; }
+  else if(edge===1){ x=W+s; y=Math.random()*H; a=Math.PI+Math.random()-.5; }
+  else if(edge===2){ x=Math.random()*W; y=-s; a=Math.PI/2+Math.random()-.5; }
+  else { x=Math.random()*W; y=H+s; a=-Math.PI/2+Math.random()-.5; }
+  mice.push({ x,y,a, s, speed: 90+Math.random()*110, wob: Math.random()*10, turn:0, caught:0, hue: Math.random() });
+}
+
+function updateMice(dt){
+  for(const m of mice){
+    if(m.caught){ m.caught += dt; continue; }
+    m.wob += dt*14;
+    m.turn += (Math.random()-.5)*dt*9;
+    m.turn *= 0.94;
+    m.a += m.turn*dt*2.2;
+    // huir de la mano abierta (más difícil)
+    for(const h of hands){
+      const d = dist(m,h.palm);
+      if(d < h.size*2.8 && !h.closed){
+        const away = Math.atan2(m.y-h.palm.y, m.x-h.palm.x);
+        let diff = Math.atan2(Math.sin(away-m.a), Math.cos(away-m.a));
+        m.a += diff*dt*5;
+      }
+    }
+    const sp = m.speed * (1 + Math.min(1,(GAME_TIME-timeLeft)/GAME_TIME)*0.5);
+    m.x += Math.cos(m.a)*sp*dt;
+    m.y += Math.sin(m.a)*sp*dt;
+    // rebote suave en bordes
+    const pad = m.s*0.5;
+    if(m.x<pad){ m.x=pad; m.a = Math.PI - m.a; }
+    if(m.x>W-pad){ m.x=W-pad; m.a = Math.PI - m.a; }
+    if(m.y<pad){ m.y=pad; m.a = -m.a; }
+    if(m.y>H-pad){ m.y=H-pad; m.a = -m.a; }
+  }
+  mice = mice.filter(m => m.caught < 0.28);
+}
+
+function drawMouse(m){
+  const s = m.s;
+  let sc = 1, rot = 0, alpha = 1;
+  if(m.caught){ const k = m.caught/0.28; sc = 1 - k; rot = k*Math.PI*3; alpha = 1-k; }
+  ctx.save();
+  ctx.translate(m.x, m.y);
+  ctx.rotate(m.a + rot);
+  ctx.scale(sc, sc);
+  ctx.globalAlpha = alpha;
+  // sombra
+  ctx.fillStyle = 'rgba(0,0,0,.28)';
+  ctx.beginPath(); ctx.ellipse(2, 6, s*1.1, s*.6, 0, 0, 7); ctx.fill();
+  // cola
+  ctx.strokeStyle = '#ff9fb5'; ctx.lineWidth = s*.12; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(-s*.9, 0);
+  const w = Math.sin(m.wob)*s*.35;
+  ctx.bezierCurveTo(-s*1.5, w, -s*1.9, -w, -s*2.4, w*.6);
+  ctx.stroke();
+  // cuerpo
+  const g = ctx.createRadialGradient(-s*.2,-s*.2,s*.1, 0,0,s*1.1);
+  g.addColorStop(0,'#d9dde6'); g.addColorStop(1,'#8f96a6');
+  ctx.fillStyle = g; ctx.strokeStyle = '#2a2f3a'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.ellipse(0,0,s,s*.62,0,0,7); ctx.fill(); ctx.stroke();
+  // patitas (corren)
+  ctx.fillStyle = '#ffb3c4';
+  const l = Math.sin(m.wob*1.2)*s*.25;
+  for(const sx of [-.4,.45]) for(const sy of [-1,1]){
+    ctx.beginPath(); ctx.ellipse(sx*s + (sy>0?l:-l)*.5, sy*s*.62, s*.14, s*.09, 0,0,7); ctx.fill();
+  }
+  // orejas
+  ctx.fillStyle = '#ffb3c4'; ctx.strokeStyle = '#2a2f3a';
+  for(const sy of [-1,1]){
+    ctx.beginPath(); ctx.arc(s*.45, sy*s*.5, s*.3, 0, 7); ctx.fill(); ctx.stroke();
+  }
+  // hocico
+  ctx.fillStyle = '#c4c9d6';
+  ctx.beginPath(); ctx.moveTo(s*.55,-s*.34); ctx.lineTo(s*1.25,0); ctx.lineTo(s*.55,s*.34); ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = '#ff6f91'; ctx.beginPath(); ctx.arc(s*1.25,0,s*.11,0,7); ctx.fill();
+  // ojos
+  ctx.fillStyle = '#111';
+  for(const sy of [-1,1]){ ctx.beginPath(); ctx.arc(s*.62, sy*s*.2, s*.07, 0, 7); ctx.fill(); }
+  ctx.restore();
+}
+
+/* ---------- Efectos ---------- */
+function burst(x,y){
+  const cols = ['#6cf5b5','#ff7ad9','#ffe66c','#7ac7ff'];
+  for(let i=0;i<22;i++){
+    const a = Math.random()*Math.PI*2, v = 80+Math.random()*260;
+    particles.push({ x,y, vx:Math.cos(a)*v, vy:Math.sin(a)*v, life:1, r:3+Math.random()*6, c:cols[i%cols.length] });
+  }
+  rings.push({x,y,t:0});
+  rings.push({x,y,t:-0.08});
+}
+function drawFx(dt){
+  for(const p of particles){
+    p.life -= dt*1.6; p.x += p.vx*dt; p.y += p.vy*dt; p.vx*=.96; p.vy*=.96; p.vy += 120*dt;
+    ctx.globalAlpha = Math.max(0,p.life); ctx.fillStyle = p.c;
+    ctx.beginPath(); ctx.arc(p.x,p.y,p.r*p.life,0,7); ctx.fill();
+  }
+  particles = particles.filter(p=>p.life>0);
+  for(const r of rings){
+    r.t += dt;
+    if(r.t<0) continue;
+    const k = r.t/0.45;
+    ctx.globalAlpha = Math.max(0,1-k);
+    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 5*(1-k)+1;
+    ctx.beginPath(); ctx.arc(r.x,r.y, 10+k*mouseSize()*2.4, 0, 7); ctx.stroke();
+  }
+  rings = rings.filter(r=>r.t<0.45);
+  for(const f of floaters){
+    f.t += dt;
+    const k = f.t/0.9;
+    ctx.globalAlpha = Math.max(0,1-k*k);
+    ctx.fillStyle = f.c; ctx.strokeStyle='#000'; ctx.lineWidth=4;
+    ctx.font = `800 ${Math.round(mouseSize()*(0.9+ (1-k)*.5))}px system-ui`;
+    ctx.textAlign='center';
+    const y = f.y - k*70;
+    ctx.strokeText(f.text, f.x, y); ctx.fillText(f.text, f.x, y);
+  }
+  floaters = floaters.filter(f=>f.t<0.9);
+  ctx.globalAlpha = 1;
+}
+
+/* ---------- Captura ---------- */
+function checkCatches(now){
+  if(state!=='playing') return;
+  for(const h of hands){
+    const active = grabMode ? h.closed : true;
+    if(!active) continue;
+    // en modo agarrar usamos el centro de la palma; en modo tocar, la punta del índice también
+    const probes = grabMode ? [h.palm] : [h.palm, h.pts[8], h.pts[12]];
+    for(const m of mice){
+      if(m.caught) continue;
+      for(const p of probes){
+        if(dist(m,p) < m.s*1.1 + h.size*0.55){
+          catchMouse(m, now); break;
+        }
+      }
+    }
+  }
+}
+function catchMouse(m, now){
+  m.caught = 0.0001;
+  combo = (now - lastCatch < 1.6) ? combo+1 : 1;
+  lastCatch = now;
+  const pts = 10 * Math.min(combo, 8);
+  score += pts;
+  blop(1 + Math.min(combo,8)*0.07);
+  burst(m.x, m.y);
+  floaters.push({ x:m.x, y:m.y-m.s, t:0, text:'+'+pts, c: combo>2 ? '#ff7ad9' : '#6cf5b5' });
+  $('score').textContent = score;
+  $('combo').textContent = combo>1 ? 'Combo x'+combo : '';
+}
+
+/* ---------- Dibujo mano ---------- */
+function drawHands(){
+  for(const h of hands){
+    const col = h.closed ? '#6cf5b5' : '#7ac7ff';
+    ctx.strokeStyle = col; ctx.lineWidth = 3; ctx.shadowColor = col; ctx.shadowBlur = 12; ctx.lineCap='round';
+    for(const c of HandLandmarker.HAND_CONNECTIONS){
+      const a = h.pts[c.start], b = h.pts[c.end];
+      ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+    }
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#fff';
+    for(const p of h.pts){ ctx.beginPath(); ctx.arc(p.x,p.y,3,0,7); ctx.fill(); }
+    // zona de captura
+    ctx.strokeStyle = col; ctx.globalAlpha = .7; ctx.lineWidth = 2; ctx.setLineDash([6,6]);
+    ctx.beginPath(); ctx.arc(h.palm.x,h.palm.y,h.size*0.55+mouseSize()*1.1,0,7); ctx.stroke();
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
+  }
+}
+
+/* ---------- Loop ---------- */
+let prev = performance.now(), fpsAcc = 0, fpsN = 0;
+function loop(){
+  const nowMs = performance.now();
+  const dt = Math.min(0.05, (nowMs-prev)/1000); prev = nowMs;
+  const now = nowMs/1000;
+
+  // detección (solo si hay frame nuevo)
+  if(landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime){
+    lastVideoTime = video.currentTime;
+    try { processHands(landmarker.detectForVideo(video, nowMs)); } catch(e){ /* frame perdido */ }
+  }
+
+  // fondo: cámara espejada (cover)
+  ctx.clearRect(0,0,W,H);
+  if(video.readyState >= 2){
+    const vw = video.videoWidth, vh = video.videoHeight, s = Math.max(W/vw, H/vh);
+    const dw = vw*s, dh = vh*s, dx = (W-dw)/2, dy = (H-dh)/2;
+    ctx.save(); ctx.translate(W,0); ctx.scale(-1,1);
+    ctx.drawImage(video, dx, dy, dw, dh);
+    ctx.restore();
+    ctx.fillStyle = 'rgba(8,10,18,.18)'; ctx.fillRect(0,0,W,H);
+  } else { ctx.fillStyle = '#0a0c10'; ctx.fillRect(0,0,W,H); }
+
+  if(state==='playing'){
+    timeLeft -= dt;
+    $('time').textContent = Math.max(0, Math.ceil(timeLeft));
+    spawnT -= dt;
+    if(spawnT<=0 && mice.filter(m=>!m.caught).length < 7){ spawnMouse(); spawnT = 0.5 + Math.random()*0.9; }
+    if(timeLeft<=0) endGame();
+    if(combo && now-lastCatch>1.6){ combo=0; $('combo').textContent=''; }
+  }
+  updateMice(dt);
+  checkCatches(now);
+  for(const m of mice) drawMouse(m);
+  drawFx(dt);
+  drawHands();
+
+  fpsAcc += dt; fpsN++;
+  if(fpsAcc>.5){ $('fps').textContent = Math.round(fpsN/fpsAcc)+' fps'; fpsAcc=0; fpsN=0; }
+  requestAnimationFrame(loop);
+}
+
+/* ---------- Flujo ---------- */
+function startGame(){
+  score=0; combo=0; lastCatch=-99; timeLeft=GAME_TIME; mice=[]; particles=[]; rings=[]; floaters=[]; spawnT=0;
+  $('score').textContent='0'; $('combo').textContent=''; $('time').textContent=GAME_TIME;
+  state='playing'; panel.classList.add('hidden');
+}
+function endGame(){
+  state='over'; mice=[];
+  if(score>best){ best=score; localStorage.setItem('ratones_best',best); }
+  $('best').textContent = 'Récord '+best;
+  panel.classList.remove('hidden');
+  panel.querySelector('h1').textContent = '¡Tiempo! ' + score + ' pts';
+  $('intro').textContent = best===score && score>0 ? '¡Nuevo récord! 🏆' : 'Récord: '+best;
+  $('start').textContent = 'Jugar de nuevo';
+}
+
+async function initCamera(){
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode:'user', width:{ideal:1280}, height:{ideal:720}, frameRate:{ideal:60} }, audio:false
+  });
+  video.srcObject = stream;
+  await video.play();
+}
+async function initLandmarker(){
+  const fileset = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const opts = (delegate) => ({
+    baseOptions:{ modelAssetPath:"https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate },
+    runningMode:"VIDEO", numHands:2,
+    minHandDetectionConfidence:.5, minHandPresenceConfidence:.5, minTrackingConfidence:.5
+  });
+  try { landmarker = await HandLandmarker.createFromOptions(fileset, opts("GPU")); }
+  catch(e){ landmarker = await HandLandmarker.createFromOptions(fileset, opts("CPU")); }
+}
+
+let booted = false;
+$('start').addEventListener('click', async () => {
+  actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+  if(actx.state==='suspended') actx.resume();
+  if(!booted){
+    $('start').disabled = true;
+    try {
+      msg.textContent = 'Pidiendo cámara…';
+      await initCamera();
+      msg.textContent = 'Cargando detector de manos…';
+      await initLandmarker();
+      booted = true; msg.textContent = '';
+      requestAnimationFrame(loop);
+    } catch(e){
+      console.error(e);
+      msg.textContent = 'No pude iniciar: ' + (e.message || e) + ' (¿HTTPS y permiso de cámara?)';
+      $('start').disabled = false;
+      return;
+    }
+    $('start').disabled = false;
+  }
+  startGame();
+});
+$('mode').addEventListener('click', () => {
+  grabMode = !grabMode;
+  $('mode').textContent = grabMode ? 'Modo: agarrar (puño)' : 'Modo: tocar (fácil)';
+  $('intro').innerHTML = grabMode
+    ? 'Los ratones corren por encima de tu cámara. <b>Cerrá el puño</b> sobre uno para atraparlo.'
+    : 'Modo fácil: con solo <b>tocar</b> un ratón con la mano lo atrapás.';
+});
+</script>
+</body>
+</html>

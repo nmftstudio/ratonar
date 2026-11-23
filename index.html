@@ -166,7 +166,7 @@ function updateMice(dt){
 function drawMouse(m){
   const s = m.s;
   let sc = 1, rot = 0, alpha = 1;
-  if(m.caught){ const k = m.caught/0.28; sc = 1 - k; rot = k*Math.PI*3; alpha = 1-k; }
+  if(m.caught){ const k = Math.min(1, m.caught/0.28); sc = Math.max(0.02, 1 - k); rot = k*Math.PI*3; alpha = Math.max(0, 1-k); }
   ctx.save();
   ctx.translate(m.x, m.y);
   ctx.rotate(m.a + rot);
@@ -221,7 +221,7 @@ function drawFx(dt){
   for(const p of particles){
     p.life -= dt*1.6; p.x += p.vx*dt; p.y += p.vy*dt; p.vx*=.96; p.vy*=.96; p.vy += 120*dt;
     ctx.globalAlpha = Math.max(0,p.life); ctx.fillStyle = p.c;
-    ctx.beginPath(); ctx.arc(p.x,p.y,p.r*p.life,0,7); ctx.fill();
+    ctx.beginPath(); ctx.arc(p.x,p.y,Math.max(0.1,p.r*p.life),0,7); ctx.fill();
   }
   particles = particles.filter(p=>p.life>0);
   for(const r of rings){
@@ -300,6 +300,10 @@ function drawHands(){
 /* ---------- Loop ---------- */
 let prev = performance.now(), fpsAcc = 0, fpsN = 0;
 function loop(){
+  requestAnimationFrame(loop);   // se reprograma primero: un error de dibujo no puede congelar el juego
+  try { frame(); } catch(e){ console.error(e); ctx.setTransform(DPR,0,0,DPR,0,0); ctx.globalAlpha=1; ctx.setLineDash([]); }
+}
+function frame(){
   const nowMs = performance.now();
   const dt = Math.min(0.05, (nowMs-prev)/1000); prev = nowMs;
   const now = nowMs/1000;
@@ -337,7 +341,6 @@ function loop(){
 
   fpsAcc += dt; fpsN++;
   if(fpsAcc>.5){ $('fps').textContent = Math.round(fpsN/fpsAcc)+' fps'; fpsAcc=0; fpsN=0; }
-  requestAnimationFrame(loop);
 }
 
 /* ---------- Flujo ---------- */
